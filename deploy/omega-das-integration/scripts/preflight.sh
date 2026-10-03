@@ -3,6 +3,10 @@ set -eu
 
 base_dir=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 env_file=${1:-"$base_dir/.env"}
+case "$env_file" in
+  /*) ;;
+  *) env_file="$(pwd)/$env_file" ;;
+esac
 
 if [ ! -f "$env_file" ]; then
   echo "missing environment file: $env_file" >&2
