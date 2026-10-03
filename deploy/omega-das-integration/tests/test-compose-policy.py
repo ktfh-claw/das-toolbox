@@ -39,9 +39,12 @@ assert proxy["read_only"] is True
 assert proxy["cap_drop"] == ["ALL"]
 assert proxy["environment"]["DAS_QUERY_ENGINE"] == "query-engine:40002"
 assert proxy["environment"]["DAS_CLIENT_ENDPOINT"] == "read-proxy:42999"
+assert proxy["environment"]["DAS_CALLBACK_PEER_HOST"] == "query-engine"
+assert proxy["environment"]["PROXY_QUERY_TIMEOUT_SECONDS"] == "60"
 assert int(proxy["environment"]["DAS_CALLBACK_PORT_LOWER"]) > 0
 assert int(proxy["environment"]["DAS_CALLBACK_PORT_UPPER"]) >= int(proxy["environment"]["DAS_CALLBACK_PORT_LOWER"])
 assert services["query-engine"]["networks"] == ["backend", "client"]
+assert "--endpoint=0.0.0.0:40002" in services["query-engine"]["command"]
 assert document["networks"]["client"]["internal"] is True
 
 dockerfile = (deployment_dir / "proxy" / "Dockerfile").read_text(encoding="utf-8")

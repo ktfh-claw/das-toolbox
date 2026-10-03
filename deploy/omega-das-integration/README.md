@@ -8,7 +8,7 @@ This lane runs MongoDB, Redis, the attention broker, the query engine, and a del
 - `client` is a separate internal network attached only to `query-engine` and `read-proxy`. An Omega client must run as a container explicitly attached to `omega-das-integration-client` and connect to `read-proxy:8080`; it cannot reach MongoDB or Redis through that network.
 - The proxy publishes no port. Private Docker-network membership is the accepted trust boundary: there is no application authentication or TLS inside it. Do not attach untrusted containers to `client`.
 - The HTTP surface exposes only `POST /v1/query`, which always creates a DAS `PatternMatchingQueryProxy`. Callers cannot select another bus command, set a context, enable count mode, update attention, populate mappings, use the link-template cache, or pass arbitrary DAS parameters. Requests, tokens, answer count, answer fields, and query duration are bounded.
-- DAS queries are bidirectional. `read-proxy:42999` is the advertised client identity and per-query gRPC callback listeners use `read-proxy:43000-43031`. The query engine must be able to call the dynamic callback addresses, which is why both services share `client`. None of these ports is published or reachable from the host.
+- DAS queries are bidirectional. `read-proxy:42999` is the advertised client identity and per-query gRPC callback listeners use `read-proxy:43000-43031`. The query engine must be able to call the dynamic callback addresses, which is why both services share `client`. The engine listens on all of its private interfaces and consequently advertises dynamic processor peers as `0.0.0.0:42000-42999`; the proxy rewrites only those wildcard callback hosts to the explicit private DNS name `query-engine`, retaining the advertised port. None of these ports is published or reachable from the host.
 - All images require `repository@sha256:<digest>` references. Placeholder, absent, malformed, or tag-only values fail preflight/Compose interpolation.
 - MongoDB and Redis use explicitly named durable volumes. The normal rollback retains them.
 - Redis listens on the private `backend` network with protected mode disabled so its intended non-loopback peer, `query-engine`, can issue commands. Redis has no published host port, is not attached to `client`, and `backend` is internal; network membership is therefore its access boundary. Do not attach untrusted containers to `backend` or publish Redis port 6379. Append-only persistence remains enabled on its durable volume.
@@ -30,6 +30,7 @@ The Docker-free regression tests are:
 ```sh
 ./tests/test-render-config-permissions.sh
 python3 ./tests/test-compose-policy.py
+python3 ./tests/test-das-client.py
 python3 ./tests/test-read-proxy.py
 ```
 
@@ -68,7 +69,7 @@ A successful response has the stable shape:
 {"answers":[{"assignments":{"X":"..."},"handles":["..."],"importance":0.0,"strength":1.0}],"count":1,"truncated":false}
 ```
 
-Invalid input returns HTTP 400, oversized bodies return 413, unknown paths return 404, and a timeout or DAS transport failure returns 502 with a short JSON error. The proxy intentionally serializes queries because the pinned client uses process-wide singleton and port-pool state. This is a functional integration lane, not a high-throughput public API.
+Invalid input returns HTTP 400, oversized bodies return 413, unknown paths return 404, and a timeout or DAS transport failure returns 502 with a short JSON error. Query execution has a fixed 60-second server-side timeout; callers cannot extend or override it. This allows the query engine's built-in 30-second processing window to finish even though the proxy deadline starts before the client's command-dispatch sleep. The proxy intentionally serializes queries because the pinned client uses process-wide singleton and port-pool state. This is a functional integration lane, not a high-throughput public API.
 
 ## Rollback
 

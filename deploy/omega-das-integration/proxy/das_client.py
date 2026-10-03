@@ -8,6 +8,7 @@ import time
 from typing import Any
 
 from hyperon_das.service_clients import PatternMatchingQueryProxy
+from hyperon_das.service_bus.proxy import DistributedAlgorithmNodeManager
 from hyperon_das.service_bus.service_bus import ServiceBusSingleton
 
 
@@ -20,9 +21,11 @@ class DasQueryRunner:
 
     def __init__(self) -> None:
         client_endpoint = os.environ["DAS_CLIENT_ENDPOINT"]
+        callback_peer_host = os.environ["DAS_CALLBACK_PEER_HOST"]
         lower = int(os.environ["DAS_CALLBACK_PORT_LOWER"])
         upper = int(os.environ["DAS_CALLBACK_PORT_UPPER"])
         query_engine = os.environ["DAS_QUERY_ENGINE"]
+        _install_callback_peer_rewrite(callback_peer_host)
         self._bus = ServiceBusSingleton(
             host_id=client_endpoint,
             known_peer=query_engine,
@@ -72,6 +75,33 @@ class DasQueryRunner:
                 except Exception:
                     pass
         return answers
+
+
+def _install_callback_peer_rewrite(callback_peer_host: str) -> None:
+    """Replace only wildcard hosts advertised by processor-side callback peers.
+
+    The pinned DAS query engine uses its listening endpoint as the host portion
+    of every dynamic proxy ID. It must listen on all of its private-network
+    interfaces, but 0.0.0.0 is not a routable callback destination. Keep the
+    dynamic port and substitute the explicit Compose-private DNS name.
+    """
+    if not callback_peer_host or any(character in callback_peer_host for character in ":/[]"):
+        raise ValueError("DAS_CALLBACK_PEER_HOST must be a non-empty hostname")
+
+    manager = DistributedAlgorithmNodeManager
+    if getattr(manager, "_omega_callback_rewrite_installed", False):
+        return
+
+    original = manager.node_joined_network
+
+    def node_joined_network(self: Any, node_id: str) -> None:
+        host, separator, port = node_id.rpartition(":")
+        if separator and host in {"0.0.0.0", "::", "[::]"} and port.isdigit():
+            node_id = f"{callback_peer_host}:{port}"
+        original(self, node_id)
+
+    manager.node_joined_network = node_joined_network
+    manager._omega_callback_rewrite_installed = True
 
 
 def _normalize_answer(answer: Any) -> dict[str, Any]:
