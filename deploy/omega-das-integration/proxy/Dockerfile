@@ -26,7 +26,9 @@ RUN git clone --filter=blob:none --no-checkout https://github.com/singnet/das.gi
        -e 's/^import distributed_algorithm_node_pb2/import hyperon_das._grpc.distributed_algorithm_node_pb2/' \
        -e 's/^import common_pb2/import hyperon_das._grpc.common_pb2/' \
        /src/das/3rd_party_slots/python_client/hyperon_das/_grpc/*_pb2*.py \
-    && /opt/venv/bin/pip install --no-cache-dir /src/das/3rd_party_slots/python_client
+    && /opt/venv/bin/pip install --no-cache-dir /src/das/3rd_party_slots/python_client \
+    && site_packages=$(/opt/venv/bin/python -c 'import site; print(site.getsitepackages()[0])') \
+    && cp -a /src/das/3rd_party_slots/python_client/hyperon_das/_grpc "$site_packages/hyperon_das/"
 
 FROM python@${PYTHON_IMAGE_DIGEST}
 ENV PATH=/opt/venv/bin:$PATH \
