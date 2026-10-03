@@ -5,6 +5,32 @@ x-task-labels: &task-labels
   io.ktfh-claw.purpose: experimental-read-only-retrieval
 
 services:
+  read-proxy:
+    build:
+      context: ./proxy
+      args:
+        PYTHON_IMAGE_DIGEST: ${PYTHON_IMAGE_DIGEST:?set PYTHON_IMAGE_DIGEST to sha256:<64 hex chars>}
+    environment:
+      DAS_CALLBACK_PORT_LOWER: "43000"
+      DAS_CALLBACK_PORT_UPPER: "43031"
+      DAS_CLIENT_ENDPOINT: read-proxy:42999
+      DAS_QUERY_ENGINE: query-engine:40002
+      PROXY_HTTP_HOST: 0.0.0.0
+      PROXY_HTTP_PORT: "8080"
+      PROXY_MAX_ANSWERS: "100"
+      PROXY_MAX_QUERY_TOKENS: "256"
+      PROXY_QUERY_TIMEOUT_SECONDS: "30"
+    networks: [client]
+    labels: *task-labels
+    restart: unless-stopped
+    depends_on:
+      query-engine: {condition: service_started}
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=16m
+    security_opt: ["no-new-privileges:true"]
+    cap_drop: ["ALL"]
+
   mongodb:
     image: mongodb/mongodb-community-server@${MONGODB_IMAGE_DIGEST:?set MONGODB_IMAGE_DIGEST to sha256:<64 hex chars>}
     command: ["mongod", "--bind_ip_all", "--port", "27017"]
