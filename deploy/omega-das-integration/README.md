@@ -19,7 +19,17 @@ Copy `.env.example` to `.env`, replace every placeholder with a trusted digest/v
 ./scripts/up.sh
 ```
 
-The exact DAS commands come from `das-cli/src/common/container_manager/agents/attention_broker_container_manager.py` and `das-cli/src/common/bus_node/busnode_command_registry.py`. MongoDB and Redis commands follow their corresponding container managers. The `kill -0 1` checks prove only that the DAS entrypoint is alive because the source defines no health RPC; verify an actual retrieval from the attached Omega client before treating the POC as healthy.
+The exact DAS commands come from `das-cli/src/common/container_manager/agents/attention_broker_container_manager.py` and `das-cli/src/common/bus_node/busnode_command_registry.py`. MongoDB and Redis commands follow their corresponding container managers.
+
+The `trueagi/das` image is distroless and has no `/bin/sh`, and the repository source defines no DAS health RPC or image-provided probe command. Consequently, the deployment does not invent an in-container health check for the attention broker or query engine. MongoDB and Redis remain health-gated, while the query engine uses Compose's strongest source-supported condition for the broker, `service_started`. A successful `up.sh` therefore proves only that Compose started the DAS containers; it does not prove DAS readiness or retrieval correctness.
+
+Before treating the POC as operational, perform all of these post-start checks:
+
+1. Inspect `docker compose --env-file .env -f compose.yaml ps` and `docker compose --env-file .env -f compose.yaml logs attention-broker query-engine`; reject crash loops, exited containers, or startup errors.
+2. From an already-approved diagnostic or Omega client container attached to `omega-das-integration-client`, verify that `query-engine:40002` accepts a connection. Because the attention broker is backend-only, verify its `attention-broker:40001` listener from an already-approved container attached to `omega-das-integration-backend`. Do not add host port publications for these checks.
+3. Run a representative read-only Omega query through `query-engine:40002` and confirm the expected result. Listener checks alone are not application-level readiness checks.
+
+These checks are deliberately post-start operator validation: the deployment cannot honestly encode them as container health without a source-supported probe or a trusted external health-monitor component.
 
 Attach an already-created Omega client container without exposing a port:
 

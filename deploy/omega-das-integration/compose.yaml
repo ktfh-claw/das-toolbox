@@ -48,12 +48,6 @@ services:
     networks: [backend]
     labels: *task-labels
     restart: unless-stopped
-    healthcheck:
-      test: ["CMD-SHELL", "kill -0 1"]
-      interval: 10s
-      timeout: 3s
-      retries: 12
-      start_period: 10s
     security_opt: ["no-new-privileges:true"]
 
   query-engine:
@@ -75,13 +69,7 @@ services:
     depends_on:
       mongodb: {condition: service_healthy}
       redis: {condition: service_healthy}
-      attention-broker: {condition: service_healthy}
-    healthcheck:
-      test: ["CMD-SHELL", "kill -0 1"]
-      interval: 10s
-      timeout: 3s
-      retries: 12
-      start_period: 20s
+      attention-broker: {condition: service_started}
     security_opt: ["no-new-privileges:true"]
 
 networks:
