@@ -30,5 +30,8 @@ mongodb = document["atomdb"]["mongodb"]
 mongodb["username"] = os.environ["MONGODB_USERNAME"]
 mongodb["password"] = os.environ["MONGODB_PASSWORD"]
 destination.write_text(json.dumps(document, indent=2) + "\n", encoding="utf-8")
-destination.chmod(0o600)
+# The bind-mounted file must be readable by the image's unrelated nonroot UID.
+# Keep write access owner-only; the enclosing host home directory is the host
+# access boundary (see README.md).
+destination.chmod(0o644)
 PY

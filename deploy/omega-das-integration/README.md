@@ -9,6 +9,7 @@ This lane runs only MongoDB, Redis, the attention broker, and the query engine n
 - All images require `repository@sha256:<digest>` references. Placeholder, absent, malformed, or tag-only values fail preflight/Compose interpolation.
 - MongoDB and Redis use explicitly named durable volumes. The normal rollback retains them.
 - No loader, mutation agent, host network, privileged mode, Docker socket, or host bind port is included. Application-level authorization is not provided by the current query-engine entrypoint; use only a trusted Omega client on the private client network.
+- The generated configuration is mode `0644` because the `trueagi/das` image runs as `nonroot:nonroot` and Docker bind mounts preserve the host file's numeric ownership and mode. Without host UID mapping, owner/group-only read access cannot reliably grant that container identity access; `0644` is the minimum mode that retains owner-only writes while permitting the image to read the file. On the deployment host, keep `/home/ubuntu` non-traversable by other users (mode `0700`, as provisioned): the parent-directory boundary prevents other host users from reaching a checkout below it, so the file's other-read bit enables the bind-mounted container without broadening host access. Preflight does not alter that boundary.
 
 ## Deploy
 
@@ -18,6 +19,8 @@ Copy `.env.example` to `.env`, replace every placeholder with a trusted digest/v
 ./scripts/preflight.sh
 ./scripts/up.sh
 ```
+
+The Docker-free permission regression test is `./tests/test-render-config-permissions.sh`.
 
 The exact DAS commands come from `das-cli/src/common/container_manager/agents/attention_broker_container_manager.py` and `das-cli/src/common/bus_node/busnode_command_registry.py`. MongoDB and Redis commands follow their corresponding container managers.
 
