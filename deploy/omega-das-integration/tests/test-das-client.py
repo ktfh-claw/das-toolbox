@@ -114,6 +114,17 @@ class NestedHandleDecoderTest(unittest.TestCase):
                 with self.assertRaises(ValueError):
                     module._untokenize_nested_handle_answer(FakeQueryAnswer(), wire_answer)
 
+    def test_installed_decoder_does_not_fallback_after_wire_size_rejection(self):
+        answer = FakeQueryAnswer()
+        oversized = "1.0 0.0 0 0 " + "x" * module._MAX_WIRE_ANSWER_BYTES
+        with self.assertRaisesRegex(ValueError, "exceeds the proxy decode bound"):
+            answer.untokenize(oversized)
+
+    def test_installed_decoder_rejects_non_finite_scores(self):
+        answer = FakeQueryAnswer()
+        with self.assertRaisesRegex(ValueError, "non-finite score"):
+            answer.untokenize("nan 0.0 0 0")
+
 
 if __name__ == "__main__":
     unittest.main()

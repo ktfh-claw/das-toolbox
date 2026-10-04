@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 import os
 import threading
 import time
@@ -100,18 +101,19 @@ def _install_nested_handle_decoder() -> None:
     original = QueryAnswer.untokenize
 
     def untokenize(self: Any, token_str: str) -> None:
+        _validate_wire_answer_size(token_str)
         try:
             _untokenize_nested_handle_answer(self, token_str)
         except (ValueError, IndexError):
             original(self, token_str)
+        _validate_decoded_answer(self)
 
     QueryAnswer.untokenize = untokenize
     QueryAnswer._omega_nested_handle_decoder_installed = True
 
 
 def _untokenize_nested_handle_answer(answer: Any, token_str: str) -> None:
-    if not isinstance(token_str, str) or len(token_str.encode("utf-8")) > _MAX_WIRE_ANSWER_BYTES:
-        raise ValueError("DAS answer exceeds the proxy decode bound")
+    _validate_wire_answer_size(token_str)
 
     tokens = token_str.split()
     cursor = 0
@@ -146,6 +148,24 @@ def _untokenize_nested_handle_answer(answer: Any, token_str: str) -> None:
     answer.handles = handles
     answer.assignment = assignment
     answer.metta_expression = {}
+
+
+def _validate_wire_answer_size(token_str: str) -> None:
+    if not isinstance(token_str, str) or len(token_str.encode("utf-8")) > _MAX_WIRE_ANSWER_BYTES:
+        raise ValueError("DAS answer exceeds the proxy decode bound")
+
+
+def _validate_decoded_answer(answer: Any) -> None:
+    handles = getattr(answer, "handles", None)
+    assignments = getattr(getattr(answer, "assignment", None), "_mapping", None)
+    if not isinstance(handles, list) or len(handles) > _MAX_WIRE_HANDLES:
+        raise ValueError("decoded DAS answer has too many handles")
+    if not isinstance(assignments, dict) or len(assignments) > _MAX_WIRE_ASSIGNMENTS:
+        raise ValueError("decoded DAS answer has too many assignments")
+    if getattr(answer, "metta_expression", None):
+        raise ValueError("decoded DAS answer contains disabled MeTTa mappings")
+    if not math.isfinite(float(answer.strength)) or not math.isfinite(float(answer.importance)):
+        raise ValueError("decoded DAS answer contains a non-finite score")
 
 
 def _bounded_wire_count(token: str, maximum: int, label: str) -> int:
