@@ -65,3 +65,38 @@ for disabled_option in (
 ):
     assert f'proxy.set_parameter("{disabled_option}", False)' in adapter
 print("compose read-proxy policy test passed")
+
+loader = services["campaign-loader"]
+assert loader["profiles"] == ["operator"]
+assert loader["command"] == [
+    "db_loader",
+    "--config=/etc/das/config.json",
+    "--file=/input/campaign.metta",
+]
+assert loader["networks"] == ["backend"]
+assert "ports" not in loader
+assert "expose" not in loader
+assert "network_mode" not in loader
+assert loader["read_only"] is True
+assert loader["restart"] == "no"
+assert loader["cap_drop"] == ["ALL"]
+loader_mounts = loader["volumes"]
+assert all(mount["read_only"] is True for mount in loader_mounts)
+assert {mount["target"] for mount in loader_mounts} == {
+    "/etc/das/config.json",
+    "/input/campaign.metta",
+}
+
+backup = services["campaign-backup"]
+assert backup["profiles"] == ["operator"]
+assert backup["network_mode"] == "none"
+assert "ports" not in backup
+assert "networks" not in backup
+assert backup["read_only"] is True
+assert backup["cap_drop"] == ["ALL"]
+assert backup["cap_add"] == ["DAC_OVERRIDE", "DAC_READ_SEARCH"]
+assert backup["user"] == "0:0"
+backup_mounts = backup["volumes"]
+assert next(mount for mount in backup_mounts if mount["target"] == "/source/mongodb")["read_only"] is True
+assert next(mount for mount in backup_mounts if mount["target"] == "/source/redis")["read_only"] is True
+print("compose operator service policy test passed")
