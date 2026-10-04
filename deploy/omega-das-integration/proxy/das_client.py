@@ -8,12 +8,19 @@ import time
 from typing import Any
 
 from hyperon_das.service_clients import PatternMatchingQueryProxy
+from hyperon_das.query_answer import QueryAnswer
 from hyperon_das.service_bus.proxy import DistributedAlgorithmNodeManager
 from hyperon_das.service_bus.service_bus import ServiceBusSingleton
 
 
 class QueryFailure(RuntimeError):
     pass
+
+
+_MAX_WIRE_ANSWER_BYTES = 256 * 1024
+_MAX_HANDLE_VECTORS = 64
+_MAX_WIRE_HANDLES = 4096
+_MAX_WIRE_ASSIGNMENTS = 64
 
 
 class DasQueryRunner:
@@ -25,6 +32,7 @@ class DasQueryRunner:
         lower = int(os.environ["DAS_CALLBACK_PORT_LOWER"])
         upper = int(os.environ["DAS_CALLBACK_PORT_UPPER"])
         query_engine = os.environ["DAS_QUERY_ENGINE"]
+        _install_nested_handle_decoder()
         _install_callback_peer_rewrite(callback_peer_host)
         self._bus = ServiceBusSingleton(
             host_id=client_endpoint,
@@ -75,6 +83,76 @@ class DasQueryRunner:
                 except Exception:
                     pass
         return answers
+
+
+def _install_nested_handle_decoder() -> None:
+    """Accept the nested handle vectors emitted by the pinned C++ engine.
+
+    The Python client at the pinned DAS revision decodes the handle-vector
+    count as a flat handle count.  A normal C++ answer therefore makes it
+    interpret the first handle hash as the assignment count.  Keep the
+    matching C++ wire layout first, then retain the dependency decoder as a
+    fallback for its native flat format.
+    """
+    if getattr(QueryAnswer, "_omega_nested_handle_decoder_installed", False):
+        return
+
+    original = QueryAnswer.untokenize
+
+    def untokenize(self: Any, token_str: str) -> None:
+        try:
+            _untokenize_nested_handle_answer(self, token_str)
+        except (ValueError, IndexError):
+            original(self, token_str)
+
+    QueryAnswer.untokenize = untokenize
+    QueryAnswer._omega_nested_handle_decoder_installed = True
+
+
+def _untokenize_nested_handle_answer(answer: Any, token_str: str) -> None:
+    if not isinstance(token_str, str) or len(token_str.encode("utf-8")) > _MAX_WIRE_ANSWER_BYTES:
+        raise ValueError("DAS answer exceeds the proxy decode bound")
+
+    tokens = token_str.split()
+    cursor = 0
+
+    def take() -> str:
+        nonlocal cursor
+        if cursor >= len(tokens):
+            raise ValueError("invalid nested-handle DAS answer: unexpected end")
+        value = tokens[cursor]
+        cursor += 1
+        return value
+
+    answer.strength = float(take())
+    answer.importance = float(take())
+    vector_count = _bounded_wire_count(take(), _MAX_HANDLE_VECTORS, "handle vectors")
+    handles: list[str] = []
+    for _ in range(vector_count):
+        vector_size = _bounded_wire_count(take(), _MAX_WIRE_HANDLES - len(handles), "handles")
+        handles.extend(take() for _ in range(vector_size))
+
+    assignment_count = _bounded_wire_count(take(), _MAX_WIRE_ASSIGNMENTS, "assignments")
+    assignment = type(answer.assignment)()
+    for _ in range(assignment_count):
+        assignment.assign(take(), take())
+
+    # This proxy always disables populate_metta_mapping. Supporting its
+    # whitespace-bearing expression encoding here would broaden an unused
+    # protocol surface, so reject it explicitly.
+    if _bounded_wire_count(take(), 0, "MeTTa mappings") != 0 or cursor != len(tokens):
+        raise ValueError("invalid nested-handle DAS answer: trailing data")
+
+    answer.handles = handles
+    answer.assignment = assignment
+    answer.metta_expression = {}
+
+
+def _bounded_wire_count(token: str, maximum: int, label: str) -> int:
+    count = int(token)
+    if count < 0 or count > maximum:
+        raise ValueError(f"invalid nested-handle DAS answer: {label} count out of bounds")
+    return count
 
 
 def _install_callback_peer_rewrite(callback_peer_host: str) -> None:
