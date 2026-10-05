@@ -31,6 +31,7 @@ MAX_HISTORY_STRING_CHARS = 65_536
 IMPORT_ID_RE = re.compile(r"[a-z0-9][a-z0-9-]{2,63}\Z")
 HISTORY_TIMESTAMP_RE = re.compile(r"\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\Z")
 HISTORY_RECORD_START_RE = re.compile(r'\("\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}"')
+HISTORY_STV_VALUE_RE = re.compile(r"(?:0(?:\.\d+)?|1(?:\.0+)?)\Z")
 VALUE_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9 _.,:/#@+'-]{0,255}\Z")
 FORBIDDEN_RE = re.compile(
     r"(?i)(?:^|[^a-z0-9_])(?:shell|remember|pin|websearch|query|metta|exec|eval|"
@@ -530,6 +531,10 @@ def _pln_concept(value: Any) -> str:
     if isinstance(value, list) and len(value) == 2:
         constructor = _history_symbol(value[0])
         item = _history_symbol(value[1])
+        if constructor == "Concept" and item is not None:
+            if not item or item.startswith(("$", "%", "?")):
+                raise HistorySkip("variable_operand")
+            return item
         if constructor in {"IntSet", "ExtSet"} and item is not None:
             if not item or item.startswith(("$", "%", "?")):
                 raise HistorySkip("variable_operand")
@@ -568,7 +573,42 @@ def _history_command_name(command: Any) -> str:
     name = _history_symbol(command[0])
     if name is None or not re.fullmatch(r"[A-Za-z][A-Za-z0-9_-]{0,31}", name):
         return "other"
-    return name.lower()
+    return name
+
+
+def _valid_history_timestamp(value: str) -> bool:
+    if HISTORY_TIMESTAMP_RE.fullmatch(value) is None:
+        return False
+    try:
+        dt.datetime.strptime(value, "%Y-%m-%d %H:%M:%S")
+    except ValueError:
+        return False
+    return True
+
+
+def _is_history_stv(value: Any) -> bool:
+    return (
+        isinstance(value, list)
+        and len(value) == 3
+        and _history_symbol(value[0]) == "stv"
+        and all(
+            (symbol := _history_symbol(item)) is not None
+            and HISTORY_STV_VALUE_RE.fullmatch(symbol) is not None
+            for item in value[1:]
+        )
+    )
+
+
+def _history_relation_nodes(value: Any) -> list[list[Any]]:
+    """Find semantic-looking nodes for rejection accounting, never extraction."""
+    found: list[list[Any]] = []
+    if not isinstance(value, list):
+        return found
+    if value and _history_symbol(value[0]) in RELATION_SCHEMA:
+        found.append(value)
+    for child in value:
+        found.extend(_history_relation_nodes(child))
+    return found
 
 
 def _increment(counter: dict[str, int], key: str) -> None:
@@ -620,7 +660,7 @@ def extract_history(source: Path, import_id: str) -> tuple[str, dict[str, Any]]:
             and len(parsed) == 2
             and isinstance(parsed[0], tuple)
             and parsed[0][0] == "string"
-            and HISTORY_TIMESTAMP_RE.fullmatch(parsed[0][1])
+            and _valid_history_timestamp(parsed[0][1])
             and isinstance(parsed[1], list)
         ):
             _increment(record_counts, "non_campaign_form")
@@ -652,71 +692,102 @@ def extract_history(source: Path, import_id: str) -> tuple[str, dict[str, Any]]:
             payload_hash = sha256_bytes(payload.encode("utf-8"))
             entry_hash = sha256_bytes(entry["raw"].encode("utf-8"))
 
-            def visit(node: Any, extraction_allowed: bool = True) -> None:
+            def consider_candidate(
+                node: list[Any],
+                context: str,
+                rejection_reason: str | None = None,
+            ) -> None:
                 nonlocal candidate_count
-                if not isinstance(node, list):
+                if not node or _history_symbol(node[0]) not in RELATION_SCHEMA:
                     return
-                relation = _history_symbol(node[0]) if node else None
-                if relation in RELATION_SCHEMA:
-                    candidate_count += 1
-                    if not extraction_allowed:
-                        _increment(candidate_reasons, "unsafe_parent_context")
-                    else:
-                        candidate_text = _render_history_expression(node)
-                        try:
-                            canonical = _normalize_history_candidate(
-                                node, entry["start_line"]
-                            )
-                        except HistorySkip as error:
-                            _increment(candidate_reasons, str(error))
-                        else:
-                            if canonical in seen:
-                                _increment(candidate_reasons, "duplicate_canonical_fact")
-                            elif len(records) >= MAX_ASSERTIONS:
-                                raise ValidationError(
-                                    f"history extraction exceeds {MAX_ASSERTIONS} facts"
-                                )
-                            else:
-                                seen.add(canonical)
-                                relation_name = canonical[1:].split(" ", 1)[0]
-                                relation_counts[relation_name] += 1
-                                canonical_hash = sha256_bytes(canonical.encode("utf-8"))
-                                locator = (
-                                    f"line:{entry['start_line']}"
-                                    if entry["start_line"] == entry["end_line"]
-                                    else f"lines:{entry['start_line']}-{entry['end_line']}"
-                                )
-                                records.append(
-                                    {
-                                        "source_entry": entry_number,
-                                        "source_line": entry["start_line"],
-                                        "source_end_line": entry["end_line"],
-                                        "source_locator": locator,
-                                        "source_entry_sha256": entry_hash,
-                                        "metta_payload_sha256": payload_hash,
-                                        "candidate_sha256": sha256_bytes(
-                                            candidate_text.encode("utf-8")
-                                        ),
-                                        "canonical_assertion": canonical,
-                                        "canonical_sha256": canonical_hash,
-                                    }
-                                )
-                    # A relation's operands are not independently asserted facts.
-                    # This is especially important for antecedents/consequents of
-                    # Implication, which must never be promoted to top-level facts.
-                    child_allowed = False
-                else:
-                    # Only the observed inert PLN evidence wrapper and anonymous
-                    # grouping lists may contain assertions. In particular, do
-                    # not extract through Implication, quote, match, progn,
-                    # add-atom, or any other executable/mutating form.
-                    child_allowed = extraction_allowed and (
-                        relation == "|~" or relation is None
+                candidate_count += 1
+                if rejection_reason is not None:
+                    _increment(candidate_reasons, rejection_reason)
+                    return
+                try:
+                    candidate_text = _render_history_expression(node)
+                    canonical = _normalize_history_candidate(
+                        node, entry["start_line"]
                     )
-                for child in node:
-                    visit(child, child_allowed)
+                except HistorySkip as error:
+                    _increment(candidate_reasons, str(error))
+                else:
+                    if canonical in seen:
+                        _increment(candidate_reasons, "duplicate_canonical_fact")
+                    elif len(records) >= MAX_ASSERTIONS:
+                        raise ValidationError(
+                            f"history extraction exceeds {MAX_ASSERTIONS} facts"
+                        )
+                    else:
+                        seen.add(canonical)
+                        relation_name = canonical[1:].split(" ", 1)[0]
+                        relation_counts[relation_name] += 1
+                        canonical_hash = sha256_bytes(canonical.encode("utf-8"))
+                        locator = (
+                            f"line:{entry['start_line']}"
+                            if entry["start_line"] == entry["end_line"]
+                            else f"lines:{entry['start_line']}-{entry['end_line']}"
+                        )
+                        records.append(
+                            {
+                                "source_entry": entry_number,
+                                "source_line": entry["start_line"],
+                                "source_end_line": entry["end_line"],
+                                "source_locator": locator,
+                                "source_entry_sha256": entry_hash,
+                                "metta_payload_sha256": payload_hash,
+                                "candidate_sha256": sha256_bytes(
+                                    candidate_text.encode("utf-8")
+                                ),
+                                "canonical_assertion": canonical,
+                                "canonical_sha256": canonical_hash,
+                                "extraction_context": context,
+                            }
+                        )
 
-            visit(payload_ast)
+            def reject_nested(value: Any, reason: str) -> None:
+                for candidate in _history_relation_nodes(value):
+                    consider_candidate(candidate, "rejected", reason)
+
+            payload_relation = (
+                _history_symbol(payload_ast[0])
+                if isinstance(payload_ast, list) and payload_ast
+                else None
+            )
+            if payload_relation in RELATION_SCHEMA:
+                consider_candidate(payload_ast, "payload_root")
+            elif payload_relation == "|~":
+                for evidence in payload_ast[1:]:
+                    if not (
+                        isinstance(evidence, list)
+                        and len(evidence) == 2
+                        and isinstance(evidence[0], list)
+                        and _is_history_stv(evidence[1])
+                    ):
+                        reject_nested(evidence, "malformed_evidence_group")
+                        continue
+                    assertion = evidence[0]
+                    if _history_symbol(assertion[0]) in RELATION_SCHEMA:
+                        consider_candidate(assertion, "pln_evidence")
+                    else:
+                        reject_nested(assertion, "unsupported_evidence_assertion")
+            elif payload_relation == "add-atom":
+                if len(payload_ast) not in {3, 4}:
+                    reject_nested(payload_ast[1:], "malformed_persistent_wrapper")
+                elif _history_symbol(payload_ast[1]) != "&persistent":
+                    reject_nested(payload_ast[2:], "wrong_persistent_space")
+                elif not isinstance(payload_ast[2], list) or not payload_ast[2]:
+                    reject_nested(payload_ast[2:], "unsupported_persistent_assertion")
+                elif len(payload_ast) == 4 and not _is_history_stv(payload_ast[3]):
+                    reject_nested(payload_ast[2:], "malformed_truth_value")
+                elif _history_symbol(payload_ast[2][0]) in RELATION_SCHEMA:
+                    consider_candidate(payload_ast[2], "persistent_add_atom")
+                else:
+                    reject_nested(
+                        payload_ast[2], "unsupported_persistent_assertion"
+                    )
+            else:
+                reject_nested(payload_ast, "unsafe_parent_context")
 
     if not records:
         raise ValidationError("history contains no safely extractable semantic facts")
@@ -793,7 +864,28 @@ def extract_history(source: Path, import_id: str) -> tuple[str, dict[str, Any]]:
             ],
         },
     }
+    incomplete = history_parse_incompleteness(manifest)
+    manifest["extraction"]["parse_incompleteness"] = {
+        "count": sum(incomplete.values()),
+        "reasons": incomplete,
+    }
     return canonical_text, manifest
+
+
+def history_parse_incompleteness(manifest: dict[str, Any]) -> dict[str, int]:
+    """Return parse failures that can make a history import incomplete."""
+    extraction = manifest.get("extraction", {})
+    entry_counts = extraction.get("entry_counts", {})
+    record_counts = extraction.get("record_counts", {})
+    payload_reasons = extraction.get("metta_payloads", {}).get("skip_reasons", {})
+    counts = {
+        "malformed_form": entry_counts.get("malformed_form", 0),
+        "oversized_form": entry_counts.get("oversized_form", 0),
+        "unparseable_form": record_counts.get("unparseable_form", 0),
+        "malformed_metta_command": payload_reasons.get("malformed_metta_command", 0),
+        "unparseable_payload": payload_reasons.get("unparseable_payload", 0),
+    }
+    return {key: value for key, value in counts.items() if value}
 
 
 def _write_json(path: Path, document: dict[str, Any]) -> None:
@@ -838,11 +930,22 @@ def apply_import(
     import_id: str,
     *,
     history_extraction: bool = False,
+    allow_partial_history: bool = False,
 ) -> Path:
     # Validate the complete source and generate canonical assertions before
     # reserving state or invoking Docker. The loader never receives the source.
     extractor = extract_history if history_extraction else extract
     canonical, manifest = extractor(source, import_id)
+    if history_extraction:
+        incomplete = history_parse_incompleteness(manifest)
+        if incomplete and not allow_partial_history:
+            raise ValidationError(
+                "history contains malformed or unparseable records; inspect the dry-run "
+                "manifest and pass --allow-partial-history to acknowledge a partial import"
+            )
+        manifest["extraction"]["partial_history_acknowledged"] = bool(
+            incomplete and allow_partial_history
+        )
     state_root = base_dir / "state" / "campaign-imports"
     state_root.mkdir(parents=True, exist_ok=True)
     import_dir = state_root / import_id
@@ -885,10 +988,13 @@ def apply_import(
             missing = sorted(required - running)
             raise RuntimeError(f"deployment is not fully running; missing: {missing}")
 
-        manifest["status"] = "backing-up"
-        _write_json(manifest_path, manifest)
         try:
+            # Close every query path before touching datastore state. Keep both
+            # query services down until the loader has completed (or failed).
+            _run(compose + ["stop", "read-proxy"])
             _run(compose + ["stop", "query-engine"])
+            manifest["status"] = "backing-up"
+            _write_json(manifest_path, manifest)
             _run(compose + ["stop", "mongodb", "redis"])
             _run(
                 compose
@@ -896,36 +1002,40 @@ def apply_import(
                 env=environment,
             )
             manifest["backup"] = {"offline_volume_archives": _archive_metadata(backup_dir)}
-        finally:
-            # Restore all already-required services even if a stop failed
-            # halfway through. This does not create a new deployment because
-            # the fully-running precondition was checked above.
             _run(compose + ["up", "-d", "--wait", "mongodb", "redis"])
-            _run(compose + ["up", "-d", "attention-broker", "query-engine"])
-
-        manifest["status"] = "loading"
-        _write_json(manifest_path, manifest)
-        loader = _run(
-            compose + ["--profile", "operator", "run", "--rm", "--no-deps", "campaign-loader"],
-            env=environment,
-            capture=True,
-            check=False,
-        )
-        loader_output = loader.stdout or ""
-        sys.stdout.write(loader_output)
-        loader_output_path = import_dir / "loader-output.log"
-        loader_output_path.write_text(loader_output, encoding="utf-8")
-        loader_output_path.chmod(0o600)
-        manifest["loader_exit_code"] = loader.returncode
-        manifest["loader_output"] = {
-            "file": loader_output_path.name,
-            "bytes": len(loader_output.encode("utf-8")),
-            "sha256": sha256_bytes(loader_output.encode("utf-8")),
-        }
-        if loader.returncode != 0:
-            raise RuntimeError(f"loader exited with status {loader.returncode}")
-        if loader_output_has_failure(loader_output):
-            raise RuntimeError("loader output contains a terminal failure marker")
+            manifest["status"] = "loading"
+            _write_json(manifest_path, manifest)
+            loader = _run(
+                compose + ["--profile", "operator", "run", "--rm", "--no-deps", "campaign-loader"],
+                env=environment,
+                capture=True,
+                check=False,
+            )
+            loader_output = loader.stdout or ""
+            sys.stdout.write(loader_output)
+            loader_output_path = import_dir / "loader-output.log"
+            loader_output_path.write_text(loader_output, encoding="utf-8")
+            loader_output_path.chmod(0o600)
+            manifest["loader_exit_code"] = loader.returncode
+            manifest["loader_output"] = {
+                "file": loader_output_path.name,
+                "bytes": len(loader_output.encode("utf-8")),
+                "sha256": sha256_bytes(loader_output.encode("utf-8")),
+            }
+            if loader.returncode != 0:
+                raise RuntimeError(f"loader exited with status {loader.returncode}")
+            if loader_output_has_failure(loader_output):
+                raise RuntimeError("loader output contains a terminal failure marker")
+        finally:
+            # The fully-running precondition makes this restoration safe even
+            # when stopping, backup, datastore startup, or loading failed.
+            _run(
+                compose
+                + [
+                    "up", "-d", "--wait", "mongodb", "redis", "attention-broker",
+                    "query-engine", "read-proxy",
+                ]
+            )
         manifest["status"] = "loaded-unverified"
         manifest["completed_at"] = dt.datetime.now(dt.timezone.utc).isoformat()
         _write_json(manifest_path, manifest)
@@ -959,6 +1069,14 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
         action="store_true",
         help="lexically extract safe facts from timestamped Omega campaign history",
     )
+    parser.add_argument(
+        "--allow-partial-history",
+        action="store_true",
+        help=(
+            "with --apply --extract-omega-history, acknowledge malformed or "
+            "unparseable history records and import only safely extracted facts"
+        ),
+    )
     parser.add_argument("--env-file", type=Path, help="deployment environment file (apply only)")
     return parser.parse_args(argv)
 
@@ -969,6 +1087,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     source = args.source.absolute()
     if source.is_symlink():
         raise ValidationError("source must not be a symbolic link")
+    if args.allow_partial_history and not (args.apply and args.extract_omega_history):
+        raise ValidationError(
+            "--allow-partial-history requires --apply --extract-omega-history"
+        )
     if args.dry_run:
         if args.env_file is not None:
             raise ValidationError("--env-file is valid only with --apply")
@@ -985,6 +1107,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         source,
         args.import_id,
         history_extraction=args.extract_omega_history,
+        allow_partial_history=args.allow_partial_history,
     )
     print(f"load completed but requires read-only verification; manifest: {manifest_path}")
     return 0

@@ -145,6 +145,105 @@ class CampaignImportTests(unittest.TestCase):
                     base, base / ".env", source, "campaign-008"
                 )
 
+    def test_apply_keeps_query_services_down_until_loader_and_restores_them(self):
+        source = self.source('(Similarity (Concept "a") (Concept "b"))\n')
+        running = "mongodb\nredis\nattention-broker\nquery-engine\nread-proxy\n"
+
+        for loader_status in (0, 7):
+            with self.subTest(loader_status=loader_status), tempfile.TemporaryDirectory() as temporary:
+                base = Path(temporary)
+                (base / "scripts").mkdir()
+                commands = []
+
+                def fake_run(command, **kwargs):
+                    commands.append(command)
+                    if "ps" in command:
+                        return mock.Mock(stdout=running, returncode=0)
+                    if "campaign-loader" in command:
+                        return mock.Mock(stdout="loader output\n", returncode=loader_status)
+                    return mock.Mock(stdout="", returncode=0)
+
+                patches = (
+                    mock.patch.object(campaign_import, "_run", side_effect=fake_run),
+                    mock.patch.object(campaign_import, "_archive_metadata", return_value=[]),
+                )
+                with patches[0], patches[1], contextlib.redirect_stdout(io.StringIO()):
+                    if loader_status:
+                        with self.assertRaisesRegex(RuntimeError, "loader exited"):
+                            campaign_import.apply_import(
+                                base, base / ".env", source, f"service-order-{loader_status}"
+                            )
+                    else:
+                        campaign_import.apply_import(
+                            base, base / ".env", source, "service-order-ok"
+                        )
+
+                stop_proxy = next(i for i, c in enumerate(commands) if c[-2:] == ["stop", "read-proxy"])
+                stop_query = next(i for i, c in enumerate(commands) if c[-2:] == ["stop", "query-engine"])
+                stop_stores = next(i for i, c in enumerate(commands) if c[-3:] == ["stop", "mongodb", "redis"])
+                backup = next(i for i, c in enumerate(commands) if "campaign-backup" in c)
+                loader = next(i for i, c in enumerate(commands) if "campaign-loader" in c)
+                restore = next(i for i, c in enumerate(commands) if c[-5:] == [
+                    "mongodb", "redis", "attention-broker", "query-engine", "read-proxy"
+                ])
+                self.assertLess(stop_proxy, stop_query)
+                self.assertLess(stop_query, stop_stores)
+                self.assertLess(stop_stores, backup)
+                self.assertLess(backup, loader)
+                self.assertLess(loader, restore)
+
+    def test_history_apply_refuses_parse_incompleteness_without_acknowledgement(self):
+        malformed = '("2026-10-02 18:50:00" ((metta "(Inheritance Broken Fact)"))\n'
+        valid = self.history_record(
+            "2026-10-02 18:51:00", '(metta "(Inheritance Recovered Fact)")'
+        )
+        source = self.source(malformed + valid)
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary)
+            with mock.patch.object(campaign_import, "_run") as run:
+                with self.assertRaisesRegex(campaign_import.ValidationError, "allow-partial-history"):
+                    campaign_import.apply_import(
+                        base, base / ".env", source, "partial-refused",
+                        history_extraction=True,
+                    )
+                run.assert_not_called()
+
+    def test_history_apply_accepts_explicit_partial_history_acknowledgement(self):
+        malformed = '("2026-10-02 18:50:00" ((metta "(Inheritance Broken Fact)"))\n'
+        valid = self.history_record(
+            "2026-10-02 18:51:00", '(metta "(Inheritance Recovered Fact)")'
+        )
+        source = self.source(malformed + valid)
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary)
+            (base / "scripts").mkdir()
+            running = "mongodb\nredis\nattention-broker\nquery-engine\nread-proxy\n"
+
+            def fake_run(command, **kwargs):
+                if "ps" in command:
+                    return mock.Mock(stdout=running, returncode=0)
+                return mock.Mock(stdout="", returncode=0)
+
+            with mock.patch.object(campaign_import, "_run", side_effect=fake_run), \
+                    mock.patch.object(campaign_import, "_archive_metadata", return_value=[]), \
+                    contextlib.redirect_stdout(io.StringIO()):
+                manifest_path = campaign_import.apply_import(
+                    base, base / ".env", source, "partial-acknowledged",
+                    history_extraction=True, allow_partial_history=True,
+                )
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            self.assertTrue(manifest["extraction"]["partial_history_acknowledged"])
+            self.assertEqual(manifest["extraction"]["parse_incompleteness"]["count"], 1)
+
+    def test_partial_history_acknowledgement_flag_is_wired_through_cli(self):
+        args = campaign_import.parse_args(
+            [
+                "--apply", "--extract-omega-history", "--allow-partial-history",
+                "partial-cli", "/tmp/history.metta",
+            ]
+        )
+        self.assertTrue(args.allow_partial_history)
+
     def test_volume_archiver_preserves_empty_and_nonempty_sources(self):
         with tempfile.TemporaryDirectory() as temporary:
             base = Path(temporary)
@@ -215,6 +314,124 @@ class CampaignImportTests(unittest.TestCase):
         self.assertEqual(len(fact["metta_payload_sha256"]), 64)
         self.assertEqual(len(fact["candidate_sha256"]), 64)
 
+    def test_history_extracts_only_the_assertion_from_exact_persistent_add_atom(self):
+        payloads = (
+            "(add-atom &persistent (Inheritance (Concept Alpha) (Concept Beta)))",
+            "(add-atom &persistent (Inheritance Gamma (Concept Delta)) "
+            "(stv 1.0 0.9))",
+            '(add-atom &persistent (Similarity (Concept "one") (Concept "two")) '
+            "(stv 0.8 1))",
+        )
+        commands = " ".join(
+            f"(metta {json.dumps(payload)})" for payload in payloads
+        )
+        source = self.source(
+            self.history_record("2026-10-02 18:50:00", commands)
+        )
+
+        with mock.patch.object(campaign_import.subprocess, "run") as run:
+            canonical, manifest = campaign_import.extract_history(
+                source, "history-persistent"
+            )
+
+        run.assert_not_called()
+        self.assertIn(
+            '(Inheritance (Concept "Alpha") (Concept "Beta"))', canonical
+        )
+        self.assertIn(
+            '(Inheritance (Concept "Gamma") (Concept "Delta"))', canonical
+        )
+        self.assertIn('(Similarity (Concept "one") (Concept "two"))', canonical)
+        self.assertNotIn("add-atom", canonical)
+        self.assertNotIn("&persistent", canonical)
+        self.assertNotIn("stv", canonical)
+        self.assertEqual(manifest["source"]["assertion_count"], 3)
+        self.assertEqual(
+            {fact["extraction_context"] for fact in manifest["facts"]},
+            {"persistent_add_atom"},
+        )
+
+    def test_history_rejects_inexact_or_nested_persistent_add_atom_forms(self):
+        invalid_payloads = (
+            "(add-atom &self (Inheritance Wrong Space))",
+            "(add-atom &persistent)",
+            "(add-atom &persistent (Inheritance Extra Argument) unexpected)",
+            "(add-atom &persistent (Inheritance Extra Tail) (stv 1.0 0.9) tail)",
+            "(Add-Atom &persistent (Inheritance Wrong WrapperCase))",
+            "(add-atom &Persistent (Inheritance Wrong SpaceCase))",
+            "(add-atom \"&persistent\" (Inheritance String Space))",
+            "(quote (add-atom &persistent (Inheritance Nested Quote)))",
+            "((add-atom &persistent (Inheritance Anonymous Nested)))",
+            '((quote wrapper) (Inheritance ComputedHead Forged))',
+            '("wrapper" (Inheritance StringHead Forged))',
+            '(() (Inheritance EmptyHead Forged))',
+            "(|~ ((add-atom &persistent (Inheritance Evidence Nested)) "
+            "(stv 1.0 0.9)))",
+            "(add-atom &persistent (Inheritance $variable Fact))",
+            '(add-atom &persistent "(Inheritance String Forged)")',
+            "(add-atom &persistent (progn (Inheritance Operator Forged)))",
+            "(add-atom &persistent "
+            "(Implication (Inheritance Antecedent Forged) "
+            "(Inheritance Consequent Forged)))",
+            "(add-atom &persistent (Inheritance Short Stv) (stv 1.0))",
+            "(add-atom &persistent (Inheritance Long Stv) (stv 1.0 0.9 extra))",
+            "(add-atom &persistent (Inheritance Nan Stv) (stv nan 0.9))",
+            "(add-atom &persistent (Inheritance Range Stv) (stv 1.1 0.9))",
+            "(add-atom &persistent (Inheritance Case Stv) (STV 1.0 0.9))",
+            '(add-atom &persistent (Inheritance String Stv) (stv "1.0" "0.9"))',
+        )
+        commands = [
+            f"(metta {json.dumps(payload)})" for payload in invalid_payloads
+        ]
+        commands.extend(
+            (
+                "(MeTtA "
+                + json.dumps(
+                    "(add-atom &persistent (Inheritance Wrong CommandCase))"
+                )
+                + ")",
+                "(metta "
+                + json.dumps("(Inheritance Only Safe)")
+                + ")",
+            )
+        )
+        source = self.source(
+            self.history_record("2026-10-02 18:50:00", " ".join(commands))
+        )
+
+        canonical, manifest = campaign_import.extract_history(
+            source, "history-persistent-adversarial"
+        )
+
+        self.assertIn('(Inheritance (Concept "Only") (Concept "Safe"))', canonical)
+        self.assertEqual(manifest["source"]["assertion_count"], 1)
+        self.assertEqual(manifest["facts"][0]["extraction_context"], "payload_root")
+        serialized_manifest = json.dumps(manifest)
+        for marker in (
+            "Wrong",
+            "Extra",
+            "Nested",
+            "Forged",
+            "Antecedent",
+            "Consequent",
+            "Short",
+            "Long",
+            "Nan",
+            "Range",
+            "Case",
+        ):
+            self.assertNotIn(marker, canonical)
+            self.assertNotIn(marker, serialized_manifest)
+        reasons = manifest["extraction"]["semantic_candidates"]["skip_reasons"]
+        self.assertGreaterEqual(reasons["wrong_persistent_space"], 2)
+        self.assertGreaterEqual(reasons["malformed_persistent_wrapper"], 1)
+        self.assertGreaterEqual(reasons["unsafe_parent_context"], 2)
+        self.assertGreaterEqual(reasons["unsupported_evidence_assertion"], 1)
+        self.assertGreaterEqual(reasons["unsupported_persistent_assertion"], 1)
+        self.assertGreaterEqual(reasons["variable_operand"], 1)
+        self.assertGreaterEqual(reasons["not_canonical_typed_shape"], 1)
+        self.assertGreaterEqual(reasons["malformed_truth_value"], 5)
+
     def test_history_skips_variables_effectful_content_and_duplicates_by_reason(self):
         payload = (
             "(|~ ((Inheritance $1 Unsafe) (stv 1.0 0.9)) "
@@ -240,8 +457,7 @@ class CampaignImportTests(unittest.TestCase):
         reasons = manifest["extraction"]["semantic_candidates"]["skip_reasons"]
         self.assertGreaterEqual(reasons["variable_operand"], 1)
         self.assertGreaterEqual(reasons["duplicate_canonical_fact"], 1)
-        self.assertGreaterEqual(reasons["not_canonical_typed_shape"], 1)
-        self.assertGreaterEqual(reasons["unsafe_parent_context"], 2)
+        self.assertGreaterEqual(reasons["malformed_evidence_group"], 3)
         candidates = manifest["extraction"]["semantic_candidates"]
         self.assertEqual(
             candidates["seen"], candidates["accepted_unique"] + candidates["skipped"]
@@ -335,6 +551,20 @@ class CampaignImportTests(unittest.TestCase):
         self.assertNotIn("Forged", canonical)
         self.assertIn("Genuine", canonical)
         self.assertEqual(manifest["source"]["assertion_count"], 1)
+
+    def test_history_rejects_calendar_invalid_timestamp_as_non_campaign_form(self):
+        invalid = self.history_record(
+            "2026-02-30 18:50:00", '(metta "(Inheritance Forged Fact)")'
+        )
+        valid = self.history_record(
+            "2026-02-28 18:51:00", '(metta "(Inheritance Genuine Fact)")'
+        )
+        canonical, manifest = campaign_import.extract_history(
+            self.source(invalid + valid), "history-calendar"
+        )
+        self.assertNotIn("Forged", canonical)
+        self.assertIn("Genuine", canonical)
+        self.assertEqual(manifest["extraction"]["record_counts"]["non_campaign_form"], 1)
 
     def test_history_mode_accepts_realistic_line_count_without_weakening_strict_mode(self):
         record = self.history_record(
