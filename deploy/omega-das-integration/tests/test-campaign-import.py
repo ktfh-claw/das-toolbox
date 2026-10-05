@@ -513,6 +513,24 @@ class CampaignImportTests(unittest.TestCase):
         reasons = manifest["extraction"]["semantic_candidates"]["skip_reasons"]
         self.assertEqual(reasons["unsafe_parent_context"], 1)
 
+    def test_history_skips_empty_pln_evidence_assertion(self):
+        payload = (
+            "(|~ (() (stv 1.0 0.9)) "
+            "((Inheritance Safe Fact) (stv 1.0 0.9)))"
+        )
+        source = self.source(
+            self.history_record(
+                "2026-10-02 18:50:00", "(metta " + json.dumps(payload) + ")"
+            )
+        )
+
+        canonical, manifest = campaign_import.extract_history(
+            source, "history-empty-evidence"
+        )
+
+        self.assertIn('(Inheritance (Concept "Safe") (Concept "Fact"))', canonical)
+        self.assertEqual(manifest["source"]["assertion_count"], 1)
+
     def test_history_recovers_after_unclosed_form_only_at_real_record_boundary(self):
         malformed = (
             '("2026-10-02 18:50:00"\n'

@@ -762,6 +762,7 @@ def extract_history(source: Path, import_id: str) -> tuple[str, dict[str, Any]]:
                         isinstance(evidence, list)
                         and len(evidence) == 2
                         and isinstance(evidence[0], list)
+                        and bool(evidence[0])
                         and _is_history_stv(evidence[1])
                     ):
                         reject_nested(evidence, "malformed_evidence_group")
