@@ -351,6 +351,123 @@ class CampaignImportTests(unittest.TestCase):
             {"persistent_add_atom"},
         )
 
+    def test_history_detaches_well_formed_inner_stv_only(self):
+        payloads = (
+            '(add-atom &persistent (Evaluation (Predicate "parking; agents (verified)") '
+            '(Concept "real backlog") (stv 0.9 0.85)))',
+            "(add-atom &persistent (Inheritance Invalid Inner (stv nan 0.9)))",
+        )
+        commands = " ".join(f"(metta {json.dumps(item)})" for item in payloads)
+        canonical, manifest = campaign_import.extract_history(
+            self.source(self.history_record("2026-10-02 18:50:00", commands)),
+            "history-inner-stv",
+        )
+
+        self.assertIn(
+            '(Evaluation (Predicate "parking; agents (verified)") '
+            '(Concept "real backlog"))',
+            canonical,
+        )
+        self.assertNotIn("Invalid", canonical)
+        reasons = manifest["extraction"]["semantic_candidates"]["skip_reasons"]
+        self.assertEqual(reasons["malformed_truth_value"], 1)
+
+    def test_history_accepts_one_eval_fence_only_for_safe_wrappers(self):
+        payloads = (
+            "!(add-atom &persistent (Inheritance Bang Accepted))",
+            "!!(add-atom &persistent (Inheritance Double Bang))",
+            "!(remove-atom &persistent (Inheritance Removed Fact))",
+            "!(query (Inheritance Queried Fact))",
+            "!(Inheritance Direct Rejected)",
+        )
+        commands = " ".join(f"(metta {json.dumps(item)})" for item in payloads)
+        canonical, manifest = campaign_import.extract_history(
+            self.source(self.history_record("2026-10-02 18:50:00", commands)),
+            "history-bang-fence",
+        )
+
+        self.assertIn('(Inheritance (Concept "Bang") (Concept "Accepted"))', canonical)
+        self.assertNotIn("Double", canonical)
+        self.assertNotIn("Removed", canonical)
+        self.assertNotIn("Queried", canonical)
+        self.assertNotIn("Direct", canonical)
+        self.assertEqual(
+            manifest["extraction"]["metta_payloads"]["skip_reasons"][
+                "unparseable_payload"
+            ],
+            1,
+        )
+        self.assertEqual(
+            manifest["extraction"]["semantic_candidates"]["skip_reasons"][
+                "unsafe_parent_context"
+            ],
+            3,
+        )
+
+    def test_history_value_alphabet_and_length_are_history_only(self):
+        punctuation = ";()~&%$+=<>[]{}*^|\u2014"
+        payloads = [
+            f'(Evaluation (Predicate "value{character}") (Concept "accepted"))'
+            for character in punctuation
+        ]
+        payloads.extend(
+            (
+                f'(Evaluation (Predicate "A{"x" * 512}") (Concept "too long"))',
+                '(Evaluation (Predicate "safe shell value") (Concept "forbidden"))',
+            )
+        )
+        commands = " ".join(f"(metta {json.dumps(item)})" for item in payloads)
+        canonical, manifest = campaign_import.extract_history(
+            self.source(self.history_record("2026-10-02 18:50:00", commands)),
+            "history-value-alphabet",
+        )
+
+        for character in punctuation:
+            self.assertIn(json.dumps(f"value{character}")[1:-1], canonical)
+        self.assertNotIn("too long", canonical)
+        self.assertNotIn("safe shell value", canonical)
+        reasons = manifest["extraction"]["semantic_candidates"]["skip_reasons"]
+        self.assertEqual(reasons["canonical_validation_rejected"], 2)
+        with self.assertRaisesRegex(campaign_import.ValidationError, "malformed"):
+            campaign_import.normalize_assertion(
+                '(Evaluation (Predicate "strict;value") (Concept "safe"))', 1
+            )
+        with self.assertRaisesRegex(campaign_import.ValidationError, "malformed"):
+            campaign_import.normalize_assertion(
+                f'(Evaluation (Predicate "A{"x" * 256}") (Concept "safe"))', 1
+            )
+
+    def test_history_converts_bare_evaluation_and_rejects_variables(self):
+        payload = (
+            "(|~ ((Evaluation observed finding) (stv 0.9 0.8)) "
+            '((Evaluation (Predicate "typed predicate") (Concept "typed concept")) '
+            "(stv 1 1)) ((Evaluation $variable finding) (stv 1 1)) "
+            "((Evaluation observed ?variable) (stv 1 1)))"
+        )
+        canonical, manifest = campaign_import.extract_history(
+            self.source(
+                self.history_record(
+                    "2026-10-02 18:50:00", f"(metta {json.dumps(payload)})"
+                )
+            ),
+            "history-evaluation-fallback",
+        )
+
+        self.assertIn(
+            '(Evaluation (Predicate "observed") (Concept "finding"))', canonical
+        )
+        self.assertIn(
+            '(Evaluation (Predicate "typed predicate") (Concept "typed concept"))',
+            canonical,
+        )
+        self.assertNotIn("variable", canonical)
+        self.assertEqual(
+            manifest["extraction"]["semantic_candidates"]["skip_reasons"][
+                "variable_operand"
+            ],
+            2,
+        )
+
     def test_history_rejects_inexact_or_nested_persistent_add_atom_forms(self):
         invalid_payloads = (
             "(add-atom &self (Inheritance Wrong Space))",

@@ -22,6 +22,7 @@ MAX_LINE_BYTES = 2_048
 MAX_TOKENS = 32
 MAX_DEPTH = 4
 MAX_VALUE_CHARS = 256
+MAX_HISTORY_VALUE_CHARS = 512
 MAX_HISTORY_LINES = 10_000
 MAX_HISTORY_ENTRIES = 5_000
 MAX_HISTORY_ENTRY_BYTES = 131_072
@@ -33,6 +34,9 @@ HISTORY_TIMESTAMP_RE = re.compile(r"\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\Z")
 HISTORY_RECORD_START_RE = re.compile(r'\("\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}"')
 HISTORY_STV_VALUE_RE = re.compile(r"(?:0(?:\.\d+)?|1(?:\.0+)?)\Z")
 VALUE_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9 _.,:/#@+'-]{0,255}\Z")
+HISTORY_VALUE_RE = re.compile(
+    r"[A-Za-z0-9][A-Za-z0-9 _.,:/#@+';()~&%$+=<>\[\]{}*^|\u2014-]{0,511}\Z"
+)
 FORBIDDEN_RE = re.compile(
     r"(?i)(?:^|[^a-z0-9_])(?:shell|remember|pin|websearch|query|metta|exec|eval|"
     r"system|spawn|include|import|load|assert|retract|delete|match|bind|let|do|"
@@ -177,8 +181,35 @@ def _string(value: Any, line_number: int) -> str:
     return text
 
 
+def _history_string(value: Any, line_number: int) -> str:
+    if not (isinstance(value, tuple) and value[0] == "string"):
+        raise ValidationError(f"line {line_number}: values must be quoted strings")
+    text = value[1]
+    if (
+        not isinstance(text, str)
+        or len(text) > MAX_HISTORY_VALUE_CHARS
+        or not HISTORY_VALUE_RE.fullmatch(text)
+    ):
+        raise ValidationError(f"line {line_number}: malformed or oversized value")
+    if FORBIDDEN_RE.search(text):
+        raise ValidationError(f"line {line_number}: forbidden term in value")
+    return text
+
+
 def normalize_assertion(line: str, line_number: int) -> str:
-    if FORBIDDEN_RE.search(line) or any(marker in line for marker in ("$", "%", "?", "!", "`")):
+    return _normalize_assertion(line, line_number, _string, forbid_markers=True)
+
+
+def _normalize_assertion(
+    line: str,
+    line_number: int,
+    value_validator: Any,
+    *,
+    forbid_markers: bool,
+) -> str:
+    if FORBIDDEN_RE.search(line) or (
+        forbid_markers and any(marker in line for marker in ("$", "%", "?", "!", "`"))
+    ):
         raise ValidationError(f"line {line_number}: wrapper, operator, or variable is forbidden")
     parsed = _parse(_tokenize(line, line_number), line_number)
     relation = _symbol(parsed[0], line_number)
@@ -191,7 +222,7 @@ def normalize_assertion(line: str, line_number: int) -> str:
             raise ValidationError(f"line {line_number}: expected ({constructor} \"value\")")
         if _symbol(argument[0], line_number) != constructor:
             raise ValidationError(f"line {line_number}: unexpected node constructor")
-        value = json.dumps(_string(argument[1], line_number), ensure_ascii=True)
+        value = json.dumps(value_validator(argument[1], line_number), ensure_ascii=True)
         normalized_arguments.append(f"({constructor} {value})")
     return f"({relation} {' '.join(normalized_arguments)})"
 
@@ -542,27 +573,58 @@ def _pln_concept(value: Any) -> str:
     raise HistorySkip("unsupported_operand")
 
 
+def _pln_typed_value(value: Any, constructor: str) -> str:
+    symbol = _history_symbol(value)
+    if symbol is not None:
+        if not symbol or symbol.startswith(("$", "%", "?")):
+            raise HistorySkip("variable_operand")
+        return symbol
+    if isinstance(value, list) and len(value) == 2:
+        if _history_symbol(value[0]) == constructor:
+            item = value[1]
+            if isinstance(item, tuple) and item[0] == "string":
+                return item[1]
+            item_symbol = _history_symbol(item)
+            if item_symbol is not None and item_symbol.startswith(("$", "%", "?")):
+                raise HistorySkip("variable_operand")
+    raise HistorySkip("unsupported_operand")
+
+
 def _normalize_history_candidate(candidate: list[Any], line_number: int) -> str:
     relation = _history_symbol(candidate[0]) if candidate else None
     if relation not in RELATION_SCHEMA:
         raise HistorySkip("not_allowlisted_relation")
     rendered = _render_history_expression(candidate)
     try:
-        return normalize_assertion(rendered, line_number)
+        return _normalize_assertion(
+            rendered, line_number, _history_string, forbid_markers=False
+        )
     except ValidationError:
         pass
-    if relation != "Inheritance":
+    if relation == "Evaluation":
+        if len(candidate) != 3:
+            raise HistorySkip("wrong_arity")
+        left = _pln_typed_value(candidate[1], "Predicate")
+        right = _pln_typed_value(candidate[2], "Concept")
+        converted = (
+            f"(Evaluation (Predicate {json.dumps(left, ensure_ascii=True)}) "
+            f"(Concept {json.dumps(right, ensure_ascii=True)}))"
+        )
+    elif relation == "Inheritance":
+        if len(candidate) != 3:
+            raise HistorySkip("wrong_arity")
+        left = _pln_concept(candidate[1])
+        right = _pln_concept(candidate[2])
+        converted = (
+            f"(Inheritance (Concept {json.dumps(left, ensure_ascii=True)}) "
+            f"(Concept {json.dumps(right, ensure_ascii=True)}))"
+        )
+    else:
         raise HistorySkip("not_canonical_typed_shape")
-    if len(candidate) != 3:
-        raise HistorySkip("wrong_arity")
-    left = _pln_concept(candidate[1])
-    right = _pln_concept(candidate[2])
-    converted = (
-        f"(Inheritance (Concept {json.dumps(left, ensure_ascii=True)}) "
-        f"(Concept {json.dumps(right, ensure_ascii=True)}))"
-    )
     try:
-        return normalize_assertion(converted, line_number)
+        return _normalize_assertion(
+            converted, line_number, _history_string, forbid_markers=False
+        )
     except ValidationError as error:
         raise HistorySkip("canonical_validation_rejected") from error
 
@@ -681,9 +743,12 @@ def extract_history(source: Path, import_id: str) -> tuple[str, dict[str, Any]]:
                 _increment(payload_reasons, "malformed_metta_command")
                 continue
             payload = command[1][1]
+            has_eval_fence = payload.startswith("!(")
+            parsed_payload = payload[1:] if has_eval_fence else payload
             try:
                 payload_ast = _parse_history(
-                    _tokenize_history(payload, entry["start_line"]), entry["start_line"]
+                    _tokenize_history(parsed_payload, entry["start_line"]),
+                    entry["start_line"],
                 )
             except ValidationError:
                 _increment(payload_reasons, "unparseable_payload")
@@ -754,7 +819,9 @@ def extract_history(source: Path, import_id: str) -> tuple[str, dict[str, Any]]:
                 if isinstance(payload_ast, list) and payload_ast
                 else None
             )
-            if payload_relation in RELATION_SCHEMA:
+            if has_eval_fence and payload_relation not in {"add-atom", "|~"}:
+                reject_nested(payload_ast, "unsafe_parent_context")
+            elif payload_relation in RELATION_SCHEMA:
                 consider_candidate(payload_ast, "payload_root")
             elif payload_relation == "|~":
                 for evidence in payload_ast[1:]:
@@ -782,7 +849,18 @@ def extract_history(source: Path, import_id: str) -> tuple[str, dict[str, Any]]:
                 elif len(payload_ast) == 4 and not _is_history_stv(payload_ast[3]):
                     reject_nested(payload_ast[2:], "malformed_truth_value")
                 elif _history_symbol(payload_ast[2][0]) in RELATION_SCHEMA:
-                    consider_candidate(payload_ast[2], "persistent_add_atom")
+                    assertion = payload_ast[2]
+                    if (
+                        len(assertion) > 1
+                        and isinstance(assertion[-1], list)
+                        and assertion[-1]
+                        and _history_symbol(assertion[-1][0]) == "stv"
+                    ):
+                        if not _is_history_stv(assertion[-1]):
+                            reject_nested(assertion, "malformed_truth_value")
+                            continue
+                        assertion = assertion[:-1]
+                    consider_candidate(assertion, "persistent_add_atom")
                 else:
                     reject_nested(
                         payload_ast[2], "unsupported_persistent_assertion"
@@ -841,7 +919,7 @@ def extract_history(source: Path, import_id: str) -> tuple[str, dict[str, Any]]:
             "history_depth": MAX_HISTORY_DEPTH,
             "history_string_chars": MAX_HISTORY_STRING_CHARS,
             "extracted_assertions": MAX_ASSERTIONS,
-            "canonical_value_chars": MAX_VALUE_CHARS,
+            "canonical_value_chars": MAX_HISTORY_VALUE_CHARS,
         },
         "allowed_relations": {key: list(value) for key, value in RELATION_SCHEMA.items()},
         "relation_counts": relation_counts,
